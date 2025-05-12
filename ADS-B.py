@@ -1,93 +1,191 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.io import wavfile
-from scipy.signal import find_peaks
+from scipy.signal import firwin, lfilter, resample_poly, correlate
+import matplotlib.pyplot as plt
+import pyModeS as pms
 
 
-def read_wav_iq(filepath):
+# =============================================================================
+# Parametreler
+# =============================================================================
+INPUT_SAMPLE_RATE = 2400000  # Hz; orijinal WAV dosyasının örnekleme hızı
+TARGET_SAMPLE_RATE = 2000000 # Hz; downsampling sonrası kullanılacak örnekleme hızı
+BITS_PER_MESSAGE = 112       # ADS‑B Extended Squitter mesajı uzunluğu (112 bit)
+BIT_DURATION_US = 1          # Her bit 1 mikro saniye
+
+# Preamble ayarları (ADS‑B preamble tipik olarak 8 µs):
+PREAMBLE_DURATION_US = 8
+SAMPLES_PER_US = TARGET_SAMPLE_RATE / 1e6   # Örneğin: 2 örnek/µs (hedef 2 MHz)
+PREAMBLE_LENGTH = int(PREAMBLE_DURATION_US * SAMPLES_PER_US)
+
+# Preamble maskesi: ADS‑B preamble’da tipik darbe pozisyonları 0, 1, 3 ve 4.5 µs
+preamble_mask = np.zeros(PREAMBLE_LENGTH)
+for pos in [0, 1, 3, 4.5]:
+    idx = int(round(pos * SAMPLES_PER_US))
+    if idx < PREAMBLE_LENGTH:
+        preamble_mask[idx] = 1
+
+# Korelasyon için eşik: Maksimum korelasyonun %80’i
+THRESHOLD_RATIO = 0.8
+# Mesaj başlangıcında ofset denemeleri (örnek cinsinden)
+OFFSET_RANGE = [-1, 0, 1, 2, 3]
+
+# =============================================================================
+# 1. IQ Verisinin Okunması ve Kompleks Sinyal Oluşturulması
+# =============================================================================
+wav_filename = r"C:\Users\Can Tekin\OneDrive\Belgeler\adsb.2021.wav"
+sample_rate, data = wavfile.read(wav_filename)
+print("Original Sample Rate:", sample_rate)
+print("Data shape:", data.shape)
+
+if data.ndim < 2 or data.shape[1] < 2:
+    raise ValueError("Stereo IQ verisi bekleniyor (en az iki kanal).")
+
+I = data[:, 0].astype(np.float64)
+Q = data[:, 1].astype(np.float64)
+iq_signal = I + 1j * Q
+
+# =============================================================================
+# 2. Band-Pass Filtreleme (FIR)
+# =============================================================================
+numtaps = 101
+lowcut = 200e3     # 200 kHz
+highcut = 1000e3   # 1000 kHz
+nyquist = INPUT_SAMPLE_RATE / 2
+bp_coeff = firwin(numtaps, [lowcut/nyquist, highcut/nyquist], pass_zero=False)
+filtered_signal = lfilter(bp_coeff, 1.0, iq_signal)
+print("Band-pass filtre uygulandı.")
+
+# =============================================================================
+# 3. Downsampling (Polyphase Resampling)
+# =============================================================================
+# 2.4 MHz'den 2 MHz’ye geçiş: up=5, down=6 (hesaba göre 5/6 oranı)
+resampled_signal = resample_poly(filtered_signal, up=5, down=6)
+new_sample_rate = TARGET_SAMPLE_RATE
+print("Resampled Signal Length:", len(resampled_signal))
+
+# =============================================================================
+# 4. Sinyalin Envelope’unun Hesaplanması
+# =============================================================================
+envelope = np.abs(resampled_signal)
+
+# (Opsiyonel: envelope grafiğini görmek)
+# plt.figure(figsize=(12, 4))
+# plt.plot(envelope)
+# plt.title("Signal Envelope")
+# plt.xlabel("Örnek")
+# plt.ylabel("Genlik")
+# plt.show()
+
+# =============================================================================
+# 5. Preamble Tespiti (Cross-Correlation)
+# =============================================================================
+corr = correlate(envelope, preamble_mask, mode='valid')
+max_corr = np.max(corr)
+threshold = THRESHOLD_RATIO * max_corr
+candidate_indices = np.where(corr > threshold)[0]
+
+# Aday preamble indeksleri arasında minimum 1 ms (new_sample_rate * 0.001) ayrım koyuyoruz
+MIN_SEPARATION = int(new_sample_rate * 0.001)
+preamble_indices = []
+last_idx = -MIN_SEPARATION
+for idx in candidate_indices:
+    if idx - last_idx >= MIN_SEPARATION:
+         preamble_indices.append(idx)
+         last_idx = idx
+print("Aday preamble indeksleri:", preamble_indices)
+
+# =============================================================================
+# 6. Bit Demodülasyonu
+# =============================================================================
+# ADS‑B için, TARGET_SAMPLE_RATE=2 MHz ve her bit 1 µs -> bit başına yaklaşık 2 örnek
+samples_per_bit = int(new_sample_rate * BIT_DURATION_US * 1e-6)  # genellikle 2
+
+# İnterpolasyon faktörü: 2 örnek üzerinden daha hassas karar için faktörü 4 ile (2*4 = 8 örnek)
+INTERP_FACTOR = 4
+
+def demodulate_message(envelope, start_idx, samples_per_bit, num_bits, interp_factor=4):
     """
-    WAV dosyasından IQ verisini okur ve kompleks formata çevirir.
+    Belirtilen indeksten itibaren num_bits bit demodüle eder.
+    Her bit penceresindeki 2 örnek, lineer interpolasyonla (örneğin, 8 örneğe çıkartılarak)
+    iki yarının ortalamaları karşılaştırılır.
     """
-    fs, data = wavfile.read(filepath)
+    bits = ""
+    for i in range(num_bits):
+        s = start_idx + i * samples_per_bit
+        e = s + samples_per_bit
+        if e > len(envelope):
+            return None
+        bit_samples = envelope[s:e]
+        # İnterpolasyon: orijinal örnekleri daha yüksek çözünürlükte ele alıyoruz.
+        x_orig = np.arange(samples_per_bit)
+        x_interp = np.linspace(0, samples_per_bit, num=samples_per_bit * interp_factor, endpoint=False)
+        interp_vals = np.interp(x_interp, x_orig, bit_samples)
+        half = len(interp_vals) // 2
+        first_half = np.mean(interp_vals[:half])
+        second_half = np.mean(interp_vals[half:])
+        bits += "1" if first_half > second_half else "0"
+    return bits
 
-    # Stereo kontrolü (IQ verisi iki kanal olmalı)
-    if data.ndim == 2:
-        I = data[:, 0]
-        Q = data[:, 1]
-        iq_samples = I.astype(np.float32) + 1j * Q.astype(np.float32)
-    else:
-        raise ValueError("Veri tek kanal görünüyor, IQ verisi stereo olmalıdır.")
+# =============================================================================
+# 7. Mesaj Demodülasyonu ve Decode İşlemi (pyModeS ile)
+# =============================================================================
+messages = []
+for preamble_idx in preamble_indices:
+    base_msg_start = preamble_idx + PREAMBLE_LENGTH
+    valid_found = False
+    for offset in OFFSET_RANGE:
+        msg_start = base_msg_start + offset
+        if msg_start + BITS_PER_MESSAGE * samples_per_bit > len(envelope):
+            continue
+        bit_seq = demodulate_message(envelope, msg_start, samples_per_bit, BITS_PER_MESSAGE, interp_factor=INTERP_FACTOR)
+        if bit_seq is None or len(bit_seq) != BITS_PER_MESSAGE:
+            continue
+        try:
+            msg_int = int(bit_seq, 2)
+            msg_hex = format(msg_int, '028X')
+        except Exception as e:
+            print("Hex dönüşüm hatası:", e)
+            continue
+        try:
+            df = pms.common.df(msg_hex)
+            crc_val = pms.common.crc(msg_hex)
+        except Exception as e:
+            print("pyModeS DF/CRC hesaplama hatası:", e)
+            continue
+        # Geçerli ADS‑B mesajı: DF 17 ve CRC 0 olmalı
+        if df == 17 and crc_val == 0:
+            try:
+                icao = pms.adsb.icao(msg_hex)
+            except Exception:
+                icao = None
+            try:
+                tc = pms.adsb.tc(msg_hex)
+            except Exception:
+                tc = None
+            messages.append({
+                "preamble_idx": preamble_idx,
+                "offset": offset,
+                "bit_sequence": bit_seq,
+                "msg_hex": msg_hex,
+                "df": df,
+                "icao": icao,
+                "tc": tc
+            })
+            valid_found = True
+            break  # Uygun ofset bulunduysa diğer denemelere gerek yok.
+    if not valid_found:
+        print(f"Preamble {preamble_idx}: Geçerli mesaj bulunamadı.")
 
-    return fs, iq_samples
-
-
-def adaptive_threshold(amplitude):
-    """
-    Genliğin ortalaması ve standart sapmasına dayalı dinamik threshold belirler.
-    Şu an mean + 3.5 * std kullanıyoruz (daha agresif bir eşikleme)
-    """
-    mean_amp = np.mean(amplitude)
-    std_amp = np.std(amplitude)
-    return mean_amp + (3.5 * std_amp)  #  Daha katı threshold!
-
-
-def detect_preamble(iq_data, fs, min_preamble_distance=350):
-    """
-    IQ verisinde ADS-B Mode S preamble tespiti yapar.
-
-    Parametreler:
-      iq_data         : Kompleks IQ sinyali (numpy array)
-      fs             : Örnekleme frekansı (Hz) (2.4e6 gibi)
-      min_preamble_distance: Minimum preamble mesafesi (örnek cinsinden)
-
-    Dönüş:
-      preamble_indices: Preamble başlangıç indeksleri
-    """
-    # 1) Genlik hesapla
-    amplitude = np.abs(iq_data)
-
-    # 2) Dinamik eşik belirle
-    threshold = adaptive_threshold(amplitude)  #  Daha sıkı threshold uygulanıyor
-
-    # 3) Eşiği geçen zirveleri (peaks) bul
-    peaks, _ = find_peaks(amplitude, height=threshold, distance=int(fs * 0.5e-6))
-
-    # 4) Gerçek preamble olup olmadığını test et
-    preamble_candidates = []
-    for i in range(len(peaks) - 3):
-        p1, p2, p3, p4 = peaks[i:i + 4]
-
-        if (
-                abs(p2 - p1) == int(fs * 1e-6) and  # 1.0 µs aralık
-                abs(p3 - p1) == int(fs * 3.5e-6) and  # 3.5 µs aralık
-                abs(p4 - p1) == int(fs * 4.5e-6)  # 4.5 µs aralık
-        ):
-            # En son eklenen preamble ile arasında en az 350 örnek mesafe olmalı
-            if len(preamble_candidates) == 0 or (p1 - preamble_candidates[-1]) > min_preamble_distance:
-                # Ekstra güvenlik: Eğer bu preamble threshold'un altında ise, eklemiyoruz
-                avg_preamble_amp = np.mean(amplitude[p1:p1 + 20])  # İlk 20 örneğin ortalaması
-                if avg_preamble_amp > threshold:
-                    preamble_candidates.append(p1)
-
-    return np.array(preamble_candidates)
-
-
-# 📌 WAV dosyasını oku
-dosya_yolu = r"C:\Users\Can Tekin\OneDrive\Belgeler\adsb.2021.wav"
-fs, iq_samples = read_wav_iq(dosya_yolu)
-
-# 📌 Preamble tespiti (Threshold DİNAMİK, daha sıkı, min mesafe artırıldı)
-preamble_indices = detect_preamble(iq_samples, fs)
-
-# 📌 Sonuçları yazdır
-print("Bulunan preamble sayısı:", len(preamble_indices))
-
-# 📌 Grafikte işaretleyelim
-plt.figure(figsize=(10, 4))
-plt.plot(np.abs(iq_samples[:50000]), label="Amplitude")
-plt.scatter(preamble_indices, np.abs(iq_samples[preamble_indices]), color='r', marker='x', label="Preambles")
-plt.title("ADS-B Mode S Preamble Tespiti (Daha Katı Threshold ile)")
-plt.xlabel("Örnek Numarası")
-plt.ylabel("Genlik")
-plt.legend()
-plt.show()
+# =============================================================================
+# 8. Sonuçların Yazdırılması
+# =============================================================================
+if not messages:
+    print("Geçerli DF=17 ve CRC=0 olan ADS-B mesajı tespit edilemedi.")
+else:
+    print("Tespit edilen geçerli ADS-B mesajları:")
+    for msg in messages:
+        print("\nPreamble Index:", msg["preamble_idx"])
+        print("Offset (örnek):", msg["offset"])
+        print("Hex Mesaj:", msg["msg_hex"])
+        print("DF:", msg["df"], "ICAO:", msg["icao"], "TC:", msg["tc"])
